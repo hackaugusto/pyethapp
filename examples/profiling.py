@@ -220,7 +220,7 @@ def sample(signum, frame):
     _last_sample = timestamp
 
 
-def sample_toogle():
+def sample_toggle():
     global _sample_profiling
 
     if not _sample_profiling:
