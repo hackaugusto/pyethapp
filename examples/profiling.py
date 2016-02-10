@@ -365,7 +365,7 @@ except ImportError:
     trace_start = noop
     trace_stop = noop
 
-    def trace_toogle():
+    def trace_toggle():
         log.info('Trace profiling is unavailable, install the malloctrace extension')
 
 
