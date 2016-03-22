@@ -1,32 +1,43 @@
+# -*- coding: utf8 -*-
 """Provides a simple way of testing JSON RPC commands."""
 import json
+from itertools import count
+
 from tinyrpc.protocols.jsonrpc import JSONRPCProtocol
 from tinyrpc.transports.http import HttpPostClientTransport
-from pyethapp.jsonrpc import quantity_encoder, quantity_decoder
-from pyethapp.jsonrpc import data_encoder, data_decoder, address_decoder
-from pyethapp.jsonrpc import address_encoder as _address_encoder
-from pyethapp.jsonrpc import default_gasprice, default_startgas
-from ethereum.transactions import Transaction
-from ethereum.keys import privtoaddr
-from ethereum import abi
-from ethereum.utils import denoms, int_to_big_endian, big_endian_to_int, normalize_address
 
-z_address = '\x00' * 20
+from ethereum import abi
+from ethereum import slogging
+from ethereum.keys import privtoaddr
+from ethereum.transactions import Transaction
+from ethereum.utils import denoms, int_to_big_endian, big_endian_to_int, normalize_address
+from pyethapp.jsonrpc import address_encoder as _address_encoder
+from pyethapp.jsonrpc import data_encoder, data_decoder, address_decoder
+from pyethapp.jsonrpc import default_gasprice, default_startgas
+from pyethapp.jsonrpc import quantity_encoder, quantity_decoder
+
+log = slogging.get_logger('pyethapp.rpc_client')  # pylint: disable=invalid-name
+z_address = '\x00' * 20  # pylint: disable=invalid-name
+NONE = object()  # used to signal the default value of a mutable type
 
 
 def address20(address):
     if address == '':
         return address
+
     if len(address) == '42':
         address = address[2:]
+
     if len(address) == 40:
         address = address.decode('hex')
+
     assert len(address) == 20
+
     return address
 
 
-def address_encoder(a):
-    return _address_encoder(normalize_address(a))
+def address_encoder(address):
+    return _address_encoder(normalize_address(address))
 
 
 def block_tag_encoder(val):
@@ -39,22 +50,28 @@ def block_tag_encoder(val):
         assert not val
 
 
-def topic_encoder(t):
-    assert isinstance(t, (int, long))
-    return data_encoder(int_to_big_endian(t))
+def topic_encoder(topic):
+    assert isinstance(topic, (int, long))
+    return data_encoder(int_to_big_endian(topic))
 
 
-def topic_decoder(t):
-    return big_endian_to_int(data_decoder(t))
+def topic_decoder(topic):
+    return big_endian_to_int(data_decoder(topic))
 
 
 class JSONRPCClient(object):
     protocol = JSONRPCProtocol()
 
-    def __init__(self, port=4000, print_communication=True, privkey=None, sender=None):
-        "specify privkey for local signing"
-        self.transport = HttpPostClientTransport('http://127.0.0.1:{}'.format(port))
-        self.print_communication = print_communication
+    def __init__(self, host='127.0.0.1', port=4000, privkey=None, sender=None):
+        """
+        Args:
+            port (int): The remote end port.
+            sender (address): The sender address, used in `send_transaction`.
+            privkey: The key needs used to do local signing.
+            host (ipaddress): The remote end ip address.
+        """
+        http_url = 'http://{host}:{port}'.format(host=host, port=port)
+        self.transport = HttpPostClientTransport(http_url)
         self.privkey = privkey
         self._sender = sender
         self.port = port
@@ -71,11 +88,13 @@ class JSONRPCClient(object):
         return self._sender
 
     def call(self, method, *args):
+        """ Do a JSON-RPC v2 call for the given `method`. """
         request = self.protocol.create_request(method, args)
         reply = self.transport.send_message(request.serialize())
-        if self.print_communication:
-            print json.dumps(json.loads(request.serialize()), indent=2)
-            print reply
+
+        log.debug(json.dumps(json.loads(request.serialize()), indent=2))
+        log.debug(reply)
+
         return self.protocol.parse_reply(reply).result
 
     __call__ = call
@@ -83,66 +102,221 @@ class JSONRPCClient(object):
     def find_block(self, condition):
         """Query all blocks one by one and return the first one for which
         `condition(block)` evaluates to `True`.
+
+        Args:
+            condition (function): Predicate for the accepected block, it's
+                return value will be converted to boolean.
+
+        Returns:
+            The first block that satifies `condiction(block)` if there isn't a
+            good block.
         """
-        i = 0
-        while True:
-            block = self.call('eth_getBlockByNumber', quantity_encoder(i), True)
+        for curr_block in count():
+            block = self.call('eth_getBlockByNumber', quantity_encoder(curr_block), True)
+
             if condition(block) or not block:
                 return block
-            i += 1
 
-    def new_filter(self, fromBlock="", toBlock="", address=None, topics=[]):
-        encoders = dict(fromBlock=block_tag_encoder, toBlock=block_tag_encoder,
-                        address=address_encoder, topics=lambda x: [topic_encoder(t) for t in x])
-        data = {k: encoders[k](v) for k, v in locals().items()
-                if k not in ('self', 'encoders') and v is not None}
-        fid = self.call('eth_newFilter', data)
-        return quantity_decoder(fid)
+    def new_filter(self, from_block="", to_block="", address=None, topics=NONE):
+        """ Creates a filter object to notify when the state changes (logs). To
+        check if the state has changed, call eth_getFilterChanges.
 
-    def filter_changes(self, fid):
-        changes = self.call('eth_getFilterChanges', quantity_encoder(fid))
-        if not changes:
+        Topics are order-dependent. A transaction with a log with topics [A, B]
+        will be matched by the following topic filters:
+
+        - `[]` Anything.
+        - `[A]` A in first position (and anything after).
+        - `[null, B]` Anything in first position AND B in second position (and
+          anything after).
+        - `[A, B]` A in first position AND B in second position (and anything
+          after.
+        - `[[A, B], [A, B]]` (A OR B) in first position AND (A OR B) in second
+          position (and anything after).
+
+        Args:
+            from_block: Integer block number, or "latest" for the last mined
+                block or "pending", "earliest" for not yet mined transactions.
+
+            to_block: Integer block number, or "latest" for the last mined block
+                or "pending", "earliest" for not yet mined transactions.
+
+            address (address): Contract address or a list of addresses from
+                which logs should originate.
+
+            topics: List topics ids. Topics are order-dependent. Each topic
+                can also be a nested list meaning logical "or".
+
+        Returns:
+            The new topic id.
+        """
+        data = dict()
+
+        if topics is NONE:
+            topics = []
+
+        if from_block is not None:
+            data['fromBlock'] = block_tag_encoder(from_block)
+
+        if to_block is not None:
+            data['toBlock'] = block_tag_encoder(to_block)
+
+        if address is not None:
+            data['address'] = address_encoder(address)
+
+        if topics is not None:
+            data['topics'] = [
+                topic_encoder(topic)
+                for topic in topics
+            ]
+
+        filter_id = self.call('eth_newFilter', data)
+
+        return quantity_decoder(filter_id)
+
+    def filter_changes(self, filter_id):
+        """ Polling method for a filter, which returns an array of logs which
+        occurred since last poll.
+
+        Args:
+            filter_id: The filter id.
+        """
+        filter_changes = self.call('eth_getFilterChanges', quantity_encoder(filter_id))
+
+        if not filter_changes:
             return None
-        elif isinstance(changes, bytes):
-            return data_decoder(changes)
-        else:
-            decoders = dict(blockHash=data_decoder,
-                            transactionHash=data_decoder,
-                            data=data_decoder,
-                            address=address_decoder,
-                            topics=lambda x: [topic_decoder(t) for t in x],
-                            blockNumber=quantity_decoder,
-                            logIndex=quantity_decoder,
-                            transactionIndex=quantity_decoder)
-            return [{k: decoders[k](v) for k, v in c.items() if v is not None} for c in changes]
 
-    def eth_sendTransaction(self, nonce=None, sender='', to='', value=0, data='',
-                            gasPrice=default_gasprice, gas=default_startgas,
+        if isinstance(filter_changes, bytes):
+            return data_decoder(filter_changes)
+
+        attribute_decoder = {
+            'blockHash': data_decoder,
+            'transactionHash': data_decoder,
+            'data': data_decoder,
+            'address': address_decoder,
+            'topics': lambda x: [topic_decoder(t) for t in x],
+            'blockNumber': quantity_decoder,
+            'logIndex': quantity_decoder,
+            'transactionIndex': quantity_decoder,
+        }
+
+        return [
+            {
+                attribute: attribute_decoder[attribute](value)
+                for attribute, value in change_log.items()
+                if value is not None
+            }
+            for change_log in filter_changes
+        ]
+
+    def eth_sendTransaction(self, nonce=None, sender='', to='', value=0, data='',  # pylint: disable=invalid-name,too-many-arguments
+                            gasprice=default_gasprice, gas=default_startgas,
                             v=None, r=None, s=None):
-        to = normalize_address(to, allow_blank=True)
-        encoders = dict(nonce=quantity_encoder, sender=address_encoder, to=data_encoder,
-                        value=quantity_encoder, gasPrice=quantity_encoder,
-                        gas=quantity_encoder, data=data_encoder,
-                        v=quantity_encoder, r=quantity_encoder, s=quantity_encoder)
-        data = {k: encoders[k](v) for k, v in locals().items()
-                if k not in ('self', 'encoders') and v is not None}
-        data['from'] = data.pop('sender')
-        assert data.get('from') or (v and r and s)
-        res = self.call('eth_sendTransaction', data)
+        """ Creates new message call transaction or a contract creation, if the
+        data field contains code.
+
+        Args:
+            nonce (int): This allows to overwrite your own pending transactions
+                that use the same nonce.
+            sender (address): The address the transaction is send from.
+            to (address): (optional when creating new contract) The address the
+                transaction is directed to.
+            value (int): value send with this transaction.
+            data: The compiled code of a contract OR the hash of the invoked
+                method signature and encoded parameters. For details see Ethereum
+                Contract ABI.
+            gasprice (int): gasprice used for each paid gas.
+            gas (int): gas provided for the transaction execution. It will
+                return unused gas.
+
+        Returns:
+            The transaction hash, or the zero hash if the transaction is not
+            yet available.
+
+            Use eth_getTransactionReceipt to get the contract address, after
+            the transaction was mined, when you created a contract.
+        """
+        assert sender or (v and r and s)
+
+        call_data = dict()
+
+        if nonce is not None:
+            call_data['nonce'] = quantity_encoder(nonce)
+
+        if sender is not None:
+            call_data['from'] = address_encoder(sender)
+
+        if to is not None:
+            to = normalize_address(to, allow_blank=True)
+            call_data['to'] = data_encoder(to)
+
+        if value is not None:
+            call_data['value'] = quantity_encoder(value)
+
+        if data is not None:
+            call_data['data'] = data_encoder(data)
+
+        if gasprice is not None:
+            call_data['gasPrice'] = quantity_encoder(gasprice)
+
+        if gas is not None:
+            call_data['gas'] = quantity_encoder(gas)
+
+        if v is not None:
+            call_data['v'] = quantity_encoder(v)
+
+        if r is not None:
+            call_data['r'] = quantity_encoder(r)
+
+        if s is not None:
+            call_data['s'] = quantity_encoder(s)
+
+        res = self.call('eth_sendTransaction', call_data)
         return data_decoder(res)
 
-    def eth_call(self, sender='', to='', value=0, data='',
+    def eth_call(self, sender='', to='', value=0, data='',  # pylint: disable=invalid-name,too-many-arguments
                  startgas=default_startgas, gasprice=default_gasprice):
-        "call on pending block"
-        encoders = dict(sender=address_encoder, to=data_encoder,
-                        value=quantity_encoder, gasprice=quantity_encoder,
-                        startgas=quantity_encoder, data=data_encoder)
-        data = {k: encoders[k](v) for k, v in locals().items()
-                if k not in ('self', 'encoders') and v is not None}
-        for k, v in dict(gasprice='gasPrice', startgas='gas', sender='from').items():
-            data[v] = data.pop(k)
-        res = self.call('eth_call', data)
-        return data_decoder(res)
+        """
+        Executes a new message call immediately without creating a transaction
+        on the block chain.
+
+        Args:
+            sender: The address the transaction is send from.
+            to: The address the transaction is directed to.
+            value (int): Value send with this transaction.
+            data: Hash of the method signature and encoded parameters. For
+                details see Ethereum Contract ABI.
+            startgas (int): Amount of gas provided for the transaction execution.
+                eth_call consumes zero gas, but this parameter may be needed by
+                some executions.
+            gasprice (int): gasPrice used for each paid gas.
+
+        Returns:
+            The return value of executed contract.
+        """
+
+        call_data = dict()
+
+        if sender is not None:
+            call_data['from'] = address_encoder(sender)
+
+        if to is not None:
+            call_data['to'] = data_encoder(to)
+
+        if value is not None:
+            call_data['value'] = quantity_encoder(value)
+
+        if data is not None:
+            call_data['data'] = data_encoder(data)
+
+        if startgas is not None:
+            call_data['gas'] = quantity_encoder(startgas)
+
+        if gasprice is not None:
+            call_data['gasPrice'] = quantity_encoder(gasprice)
+
+        result = self.call('eth_call', call_data)
+
+        return data_decoder(result)
 
     def blocknumber(self):
         return quantity_decoder(self.call('eth_blockNumber'))
@@ -158,9 +332,10 @@ class JSONRPCClient(object):
         return address_decoder(self.call('eth_coinbase'))
 
     def balance(self, account):
-        b = quantity_decoder(
-            self.call('eth_getBalance', address_encoder(account), 'pending'))
-        return b
+        balance = quantity_decoder(
+            self.call('eth_getBalance', address_encoder(account), 'pending')
+        )
+        return balance
 
     def gaslimit(self):
         return quantity_decoder(self.call('eth_gasLimit'))
@@ -168,31 +343,39 @@ class JSONRPCClient(object):
     def lastgasprice(self):
         return quantity_decoder(self.call('eth_lastGasPrice'))
 
-    def send_transaction(self, sender, to, value=0, data='', startgas=0,
+    def send_transaction(self, sender, to, value=0, data='', startgas=0,  # pylint: disable=invalid-name,too-many-arguments
                          gasprice=10 * denoms.szabo, nonce=None):
-        "can send a locally signed transaction if privkey is given"
+        """ Send a signed transaction if privkey is given. """
         assert self.privkey or sender
+
         if self.privkey:
             _sender = sender
             sender = privtoaddr(self.privkey)
             assert sender == _sender
-        assert sender
-        # fetch nonce
-        nonce = nonce if nonce is not None else self.nonce(sender)
+
+        if nonce is None:
+            nonce = self.nonce(sender)
+
         if not startgas:
             startgas = quantity_decoder(self.call('eth_gasLimit')) - 1
 
-        # create transaction
-        tx = Transaction(nonce, gasprice, startgas, to=to, value=value, data=data)
+        transaction = Transaction(nonce, gasprice, startgas, to=to, value=value, data=data)
+
         if self.privkey:
-            tx.sign(self.privkey)
-        tx_dict = tx.to_dict()
+            transaction.sign(self.privkey)
+
+        tx_dict = transaction.to_dict()
         tx_dict.pop('hash')
-        for k, v in dict(gasprice='gasPrice', startgas='gas').items():
-            tx_dict[v] = tx_dict.pop(k)
+
+        rename = [('gasprice', 'gasPrice'), ('startgas', 'gas')]
+        for python_name, jsonrpc_name in rename:
+            tx_dict[jsonrpc_name] = tx_dict.pop(python_name)
+
         tx_dict['sender'] = sender
+
         res = self.eth_sendTransaction(**tx_dict)
         assert len(res) in (20, 32)
+
         return res.encode('hex')
 
     def new_abi_contract(self, _abi, address):
@@ -200,60 +383,98 @@ class JSONRPCClient(object):
         return ABIContract(sender, _abi, address, self.eth_call, self.send_transaction)
 
 
-class ABIContract():
+class AbiMethod(object):
+    valid_kargs = set(('gasprice', 'startgas', 'value'))
 
-    """
-    proxy for a contract
+    def __init__(self, method_name, translator, sender, address, call_func, transact_func):  # pylint: disable=too-many-arguments
+        self.method_name = method_name
+        self._translator = translator
+        self.sender = normalize_address(sender)
+        self.address = normalize_address(address)
+        self.call_func = call_func
+        self.transact_func = transact_func
+
+    def transact(self, *args, **kargs):
+        assert set(kargs.keys()).issubset(self.valid_kargs)
+        data = self._translator.encode(self.method_name, args)
+
+        txhash = self.transact_func(
+            sender=self.sender,
+            to=self.address,
+            value=kargs.pop('value', 0),
+            data=data,
+            **kargs
+        )
+
+        return txhash
+
+    def call(self, *args, **kargs):
+        assert set(kargs.keys()).issubset(self.valid_kargs)
+        data = self._translator.encode(self.method_name, args)
+
+        res = self.call_func(
+            sender=self.sender,
+            to=self.address,
+            value=kargs.pop('value', 0),
+            data=data,
+            **kargs
+        )
+
+        if res:
+            res = self._translator.decode(self.method_name, res)
+            res = res[0] if len(res) == 1 else res
+
+        return res
+
+    def __call__(self, *args, **kargs):
+        if self._translator.function_data[self.method_name]['is_constant']:
+            return self.call(*args, **kargs)
+        else:
+            return self.transact(*args, **kargs)
+
+
+class ABIContract(object):  # pylint: disable=too-few-public-methods
+    """ Proxy for a contract.
+
+    The ABIContract instance will have it's methods setup accordingly to the
+    `_abi` given in the constructor, making all `_abi` methods avaiable
+    throught this proxy.
     """
 
-    def __init__(self, sender, _abi, address, call_func, transact_func):
-        self._translator = abi.ContractTranslator(_abi)
+    def __init__(self, sender, _abi, address, call_func, transaction_func):
+        """
+        Args:
+            sender (address): The sender address.
+            _abi (string): The contract's interface in JSON.
+            address (address): The target address.
+            call_function (function): The callback for a method call.
+            transaction_function (function): The callback for a transaction call.
+        """
         self.abi = _abi
         self.address = address = normalize_address(address)
-        sender = normalize_address(sender)
-        valid_kargs = set(('gasprice', 'startgas', 'value'))
 
-        class abi_method(object):
+        translator = abi.ContractTranslator(_abi)
 
-            def __init__(this, f):
-                this.f = f
+        for method_name in translator.function_data:
+            method = AbiMethod(
+                method_name,
+                translator,
+                sender,
+                address,
+                call_func,
+                transaction_func,
+            )
 
-            def transact(this, *args, **kargs):
-                assert set(kargs.keys()).issubset(valid_kargs)
-                data = self._translator.encode(this.f, args)
-                txhash = transact_func(sender=sender,
-                                       to=address,
-                                       value=kargs.pop('value', 0),
-                                       data=data,
-                                       **kargs)
-                return txhash
+            signature = translator.function_data[method_name]['signature']
 
-            def call(this, *args, **kargs):
-                assert set(kargs.keys()).issubset(valid_kargs)
-                data = self._translator.encode(this.f, args)
-                res = call_func(sender=sender,
-                                to=address,
-                                value=kargs.pop('value', 0),
-                                data=data,
-                                **kargs)
-                if res:
-                    res = self._translator.decode(this.f, res)
-                    res = res[0] if len(res) == 1 else res
-                return res
+            type_name = [
+                '{type} {name}'.format(type=type_, name=name)
+                for (type_, name) in signature
+            ]
 
-            def __call__(this, *args, **kargs):
-                if self._translator.function_data[this.f]['is_constant']:
-                    return this.call(*args, **kargs)
-                else:
-                    return this.transact(*args, **kargs)
+            method.__doc__ = '{method}({arguments})'.format(
+                method=method_name,
+                arguments=', '.join(type_name)
+            )
 
-        for fname in self._translator.function_data:
-            func = abi_method(fname)
-            # create wrapper with signature
-            signature = self._translator.function_data[fname]['signature']
-            func.__doc__ = '%s(%s)' % (fname, ', '.join(('%s %s' % x) for x in signature))
-            setattr(self, fname, func)
-
-
-if __name__ == '__main__':
-    pass
+            setattr(self, method_name, method)
