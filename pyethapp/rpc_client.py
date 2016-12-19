@@ -1,4 +1,6 @@
-""" A simple way of interacting to a ethereum node through JSON RPC commands. """
+# -*- coding: utf8 -*-
+""" A simple way of interacting to a ethereum node through JSON RPC commands.
+"""
 import logging
 import time
 import warnings
@@ -6,11 +8,24 @@ import json
 
 import gevent
 from ethereum.abi import ContractTranslator
+from ethereum.exceptions import InvalidTransaction
 from ethereum.keys import privtoaddr
 from ethereum.transactions import Transaction
-from ethereum.utils import denoms, int_to_big_endian, big_endian_to_int, normalize_address
-from ethereum._solidity import solidity_unresolved_symbols, solidity_library_symbol, solidity_resolve_symbols
-from tinyrpc.protocols.jsonrpc import JSONRPCErrorResponse, JSONRPCSuccessResponse
+from ethereum.utils import (
+    denoms,
+    int_to_big_endian,
+    big_endian_to_int,
+    normalize_address,
+)
+from ethereum._solidity import (
+    solidity_unresolved_symbols,
+    solidity_library_symbol,
+    solidity_resolve_symbols,
+)
+from tinyrpc.protocols.jsonrpc import (
+    JSONRPCErrorResponse,
+    JSONRPCSuccessResponse,
+)
 from tinyrpc.protocols.jsonrpc import JSONRPCProtocol
 from tinyrpc.transports.http import HttpPostClientTransport
 
@@ -87,7 +102,9 @@ def dependencies_order_of_build(target_contract, dependencies_map):
         return [target_contract]
 
     if target_contract not in dependencies_map:
-        raise ValueError('no dependencies defined for {}'.format(target_contract))
+        raise ValueError(
+            'No dependencies defined for {}.'.format(target_contract)
+        )
 
     order = [target_contract]
     todo = list(dependencies_map[target_contract])
@@ -113,6 +130,10 @@ class JSONRPCClientReplyError(Exception):
     pass
 
 
+class JSONRPCClientPollTimeoutError(Exception):
+    pass
+
+
 class JSONRPCClient(object):
     protocol = JSONRPCProtocol()
 
@@ -124,13 +145,19 @@ class JSONRPCClient(object):
             port (int): port number to connect to.
             print_communication (bool): True to print the rpc communication.
             privkey: specify privkey for local signing
-            sender (address): the sender address, computed from privkey if provided.
+            sender (address): the sender address, computed from privkey if
+                provided.
             use_ssl (bool): Use https instead of http.
             transport: Tiny rpc transport instance.
         """
         if transport is None:
-            self.transport = HttpPostClientTransport('{}://{}:{}'.format(
-                'https' if use_ssl else 'http', host, port), headers={'content-type': 'application/json'})
+            protocol = 'https' if use_ssl else 'http'
+            uri = '{}://{}:{}'.format(protocol, host, port)
+
+            self.transport = HttpPostClientTransport(
+                uri,
+                headers={'content-type': 'application/json'}
+            )
         else:
             self.transport = transport
         self.print_communication = print_communication
@@ -690,11 +717,16 @@ class JSONRPCClient(object):
             while True:
                 # Could return None for a short period of time, until the
                 # transaction is added to the pool
-                transaction = self.call('eth_getTransactionByHash', transaction_hash)
+                transaction = self.call(
+                    'eth_getTransactionByHash',
+                    transaction_hash,
+                )
 
                 # if the transaction was added to the pool and then removed
                 if transaction is None and last_result is not None:
-                    raise Exception('invalid transaction, check gas price')
+                    raise InvalidTransaction(
+                        'Invalid transaction, check gas price.'
+                    )
 
                 # the transaction was added to the pool and mined
                 if transaction and transaction['blockNumber'] is not None:
@@ -706,7 +738,8 @@ class JSONRPCClient(object):
 
             if confirmations:
                 # this will wait for both APPLIED and REVERTED transactions
-                transaction_block = quantity_decoder(transaction['blockNumber'])
+                block_number = transaction['blockNumber']
+                transaction_block = quantity_decoder(block_number)
                 confirmation_block = transaction_block + confirmations
 
                 block_number = self.blocknumber()
@@ -715,8 +748,12 @@ class JSONRPCClient(object):
                     gevent.sleep(.5)
                     block_number = self.blocknumber()
 
+                return block_number
+
         except gevent.Timeout:
-            raise Exception('timeout when polling for transaction')
+            raise JSONRPCClientPollTimeoutError(
+                'Timeout when polling for transaction.'
+            )
 
         finally:
             if deadline:
